@@ -6,6 +6,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -66,7 +67,6 @@ st.markdown(
 # ==========================================
 @st.cache_data
 def load_credit_data():
-    # Dynamic path handling to avoid FileNotFoundError
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
     loans_path = os.path.join(base_dir, "loans (2).csv")
@@ -81,14 +81,23 @@ def load_credit_data():
         risk, on="application_id", how="left"
     )
 
+    # Feature Harmonization
     df["Income"] = df["monthly_income"]
     df["LoanAmount"] = df["funded_amount"]
     df["DTI"] = df["original_dti"]
     df["CreditScore"] = df["credit_score"]
-    df["HasDefault"] = df["previous_default_flag"].astype(int)
-    df["CoverageRatio"] = (
-        df["collateral_value"].fillna(0) / df["funded_amount"]
-    ).fillna(0)
+    df["HasDefault"] = df["previous_default_flag"].fillna(0).astype(int)
+
+    # Calculate Coverage Ratio with upper bound clipping to remove outliers
+    coverage = df["collateral_value"].fillna(0) / df["funded_amount"]
+    df["CoverageRatio"] = np.clip(coverage, 0, 3.0)
+
+    # Adding Loan Term if available, default to 36 if missing
+    if "term_months" in df.columns:
+        df["Term"] = df["term_months"].fillna(36)
+    else:
+        df["Term"] = 36
+
     df["IsDefault"] = df["default_flag"].astype(int)
 
     return df
@@ -106,6 +115,7 @@ feature_cols = [
     "CreditScore",
     "HasDefault",
     "CoverageRatio",
+    "Term",
 ]
 
 X = dataset[feature_cols]
@@ -115,23 +125,24 @@ X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.25, random_state=42, stratify=y
 )
 
+# Apply StandardScaler consistently
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled = scaler.transform(X_test)
 
 # Model 1: Logistic Regression
-lr_model = LogisticRegression(class_weight="balanced", random_state=42)
+lr_model = LogisticRegression(class_weight="balanced", random_state=42, max_iter=1000)
 lr_model.fit(X_train_scaled, y_train)
 y_pred_lr = lr_model.predict(X_test_scaled)
 y_prob_lr = lr_model.predict_proba(X_test_scaled)[:, 1]
 
-# Model 2: Random Forest
+# Model 2: Random Forest (Trained on scaled data for consistency)
 rf_model = RandomForestClassifier(
-    n_estimators=100, max_depth=5, class_weight="balanced", random_state=42
+    n_estimators=150, max_depth=6, min_samples_leaf=4, class_weight="balanced", random_state=42
 )
-rf_model.fit(X_train, y_train)
-y_pred_rf = rf_model.predict(X_test)
-y_prob_rf = rf_model.predict_proba(X_test)[:, 1]
+rf_model.fit(X_train_scaled, y_train)
+y_pred_rf = rf_model.predict(X_test_scaled)
+y_prob_rf = rf_model.predict_proba(X_test_scaled)[:, 1]
 
 # ==========================================
 # 4. Streamlit Application Tabs
@@ -168,10 +179,11 @@ with tab_eval:
 
     with col_table:
         st.markdown("**Performance Summary Table:**")
-        st.dataframe(pd.DataFrame(comparison_data), width="stretch")
+        st.dataframe(pd.DataFrame(comparison_data), use_container_width=True)
 
         st.info(
-            "📌 **Analytical Insight:** Random Forest handles complex and non-linear risk factors effectively, whereas Logistic Regression offers straightforward model interpretability for credit compliance."
+            "📌 **Analytical Insight:** Both models are trained on standardized feature sets. "
+            "Random Forest captures non-linear risk interaction while Logistic Regression provides linear interpretability."
         )
 
     with col_chart:
@@ -241,15 +253,17 @@ with tab_predict:
         )
 
     # Risk Metrics Calculations
-    interest_rate = 0.18 / 12
+    annual_interest_rate = 0.18
+    monthly_rate = annual_interest_rate / 12
     monthly_installment = (
         loan_amount
-        * interest_rate
-        * (1 + interest_rate) ** loan_term
-    ) / (((1 + interest_rate) ** loan_term) - 1)
+        * monthly_rate
+        * (1 + monthly_rate) ** loan_term
+    ) / (((1 + monthly_rate) ** loan_term) - 1)
 
+    # Calculate actual financial DTI ratio
     calculated_dti = (monthly_installment + monthly_obligations) / monthly_income
-    coverage_ratio = collateral_val / loan_amount
+    coverage_ratio = min(collateral_val / loan_amount, 3.0)
     has_default_flag = 1 if prior_default == "Yes" else 0
 
     st.markdown("---")
@@ -263,28 +277,32 @@ with tab_predict:
                     "CreditScore": credit_score,
                     "HasDefault": has_default_flag,
                     "CoverageRatio": coverage_ratio,
+                    "Term": loan_term,
                 }
             ]
         )
 
+        # Transform inputs using the trained StandardScaler
+        input_scaled = scaler.transform(input_data)
+
         if "Logistic" in selected_model:
-            input_scaled = scaler.transform(input_data)
             pd_probability = lr_model.predict_proba(input_scaled)[0][1]
         else:
-            pd_probability = rf_model.predict_proba(input_data)[0][1]
+            pd_probability = rf_model.predict_proba(input_scaled)[0][1]
 
         pd_percentage = pd_probability * 100
         dti_percentage = calculated_dti * 100
-        coverage_percentage = coverage_ratio * 100
+        coverage_percentage = (collateral_val / loan_amount) * 100
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Probability of Default (PD)", f"{pd_percentage:.2f}%")
         m2.metric("Debt-to-Income (DTI)", f"{dti_percentage:.1f}%")
         m3.metric("Collateral Coverage", f"{coverage_percentage:.1f}%")
 
-        if pd_percentage < 25:
+        # Adjust Risk Tier Boundaries for Balanced Classification Probabilities
+        if pd_percentage < 35:
             risk_tier = "Low Risk"
-        elif pd_percentage < 45:
+        elif pd_percentage < 55:
             risk_tier = "Medium Risk"
         else:
             risk_tier = "High Risk"
@@ -292,11 +310,12 @@ with tab_predict:
         m4.metric("Risk Rating", risk_tier)
 
         st.write("")
-        if pd_percentage <= 25 and dti_percentage <= 45:
+        # Decision Policy Logic
+        if pd_percentage <= 35 and dti_percentage <= 50 and has_default_flag == 0:
             st.success(
-                "✅ **Approved:** The applicant demonstrates low default risk and an acceptable debt-to-income ratio."
+                "✅ **Approved:** The applicant demonstrates low default risk, acceptable debt ratio, and clean credit history."
             )
-        elif pd_percentage <= 45 and dti_percentage <= 50:
+        elif pd_percentage <= 55 and dti_percentage <= 60:
             st.warning(
                 "⚠️ **Conditional Approval:** Requires additional guarantor or income verification before underwriting."
             )
